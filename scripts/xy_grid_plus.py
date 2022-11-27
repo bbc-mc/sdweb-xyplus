@@ -48,6 +48,12 @@
 # ver 1.3.1
 # Add checkbox for "save info(prompt, seed, Model hash ...) as PNG chunk"
 
+# ver 1.4.0
+# Rebase xy_grid.py on commit 10923f9
+# Add new AxisOption "Checkpoint Dropdown"
+#   - allow to choose checkpoint by dropdown
+# Add selection Radio for grid Legends
+
 from collections import namedtuple
 from copy import copy
 from itertools import permutations, chain
@@ -56,13 +62,14 @@ import csv
 from io import StringIO
 from PIL import Image
 import numpy as np
+import os
 
 import modules.scripts as scripts
 import gradio as gr
 
-from modules import images
+from modules import images, sd_samplers
 from modules.hypernetworks import hypernetwork
-from modules.processing import process_images, Processed, get_correct_sampler, StableDiffusionProcessingTxt2Img
+from modules.processing import process_images, Processed, StableDiffusionProcessingTxt2Img
 from modules.shared import opts, cmd_opts, state
 import modules.shared as shared
 import modules.sd_samplers
@@ -71,12 +78,10 @@ import re
 
 
 # Setting values
-VERSION = "1.3.1"
+VERSION = "1.4.0"
 TITLE_HEADER = "X/Y Plus"
 FILE_HEADER = "xy_plus"
-FAVORITE_AXISOPTION_NAMES = ["Nothing", "Seed", "Steps", "CFG Scale", "Prompt S/R", "Checkpoint name", "Hypernetwork"]
-
-# DEVELOPMENT_AXISOPTION_NAMES = ["Checkpoint Adv", "Prompt 1-line"]
+FAVORITE_AXISOPTION_NAMES = ["Nothing", "Seed", "Steps", "CFG Scale", "Sampler", "Prompt S/R", "Checkpoint name", "Hypernetwork", "Checkpoint Dropdown"]
 
 # flgs
 FLG_WIP = False
@@ -138,27 +143,17 @@ def apply_order(p, x, xs):
     p.prompt = prompt_tmp + p.prompt
 
 
-def build_samplers_dict(p):
-    samplers_dict = {}
-    for i, sampler in enumerate(get_correct_sampler(p)):
-        samplers_dict[sampler.name.lower()] = i
-        for alias in sampler.aliases:
-            samplers_dict[alias.lower()] = i
-    return samplers_dict
-
-
 def apply_sampler(p, x, xs):
-    sampler_index = build_samplers_dict(p).get(x.lower(), None)
-    if sampler_index is None:
+    sampler_name = sd_samplers.samplers_map.get(x.lower(), None)
+    if sampler_name is None:
         raise RuntimeError(f"Unknown sampler: {x}")
 
-    p.sampler_index = sampler_index
+    p.sampler_name = sampler_name
 
 
 def confirm_samplers(p, xs):
-    samplers_dict = build_samplers_dict(p)
     for x in xs:
-        if x.lower() not in samplers_dict.keys():
+        if x.lower() not in sd_samplers.samplers_map:
             raise RuntimeError(f"Unknown sampler: {x}")
 
 
@@ -167,6 +162,7 @@ def apply_checkpoint(p, x, xs):
     if info is None:
         raise RuntimeError(f"Unknown checkpoint: {x}")
     modules.sd_models.reload_model_weights(shared.sd_model, info)
+    p.sd_model = shared.sd_model
 
 
 def confirm_checkpoints(p, xs):
@@ -232,7 +228,6 @@ def str_permutations(x):
     """dummy function for specifying it in AxisOption's type when you want to get a list of permutations"""
     return x
 
-
 AxisOption = namedtuple("AxisOption", ["label", "type", "apply", "format_value", "confirm"])
 AxisOptionImg2Img = namedtuple("AxisOptionImg2Img", ["label", "type", "apply", "format_value", "confirm"])
 
@@ -256,12 +251,22 @@ axis_options = [
     AxisOption("Sigma noise", float, apply_field("s_noise"), format_value_add_label, None),
     AxisOption("Eta", float, apply_field("eta"), format_value_add_label, None),
     AxisOption("Clip skip", int, apply_clip_skip, format_value_add_label, None),
-    AxisOption("Denoising", float, apply_field("denoising_strength"), format_value_add_label, None)
+    AxisOption("Denoising", float, apply_field("denoising_strength"), format_value_add_label, None),
+    AxisOption("Cond. Image Mask Weight", float, apply_field("inpainting_mask_weight"), format_value_add_label, None),
+]
+
+axis_options += [
+    AxisOption("Checkpoint Dropdown", str, apply_checkpoint, format_value, confirm_checkpoints)
 ]
 
 def draw_xy_grid(p, xs, ys, x_labels, y_labels, cell, draw_legend, include_lone_images, start_from):
-    ver_texts = [[images.GridAnnotation(y)] for y in y_labels]
-    hor_texts = [[images.GridAnnotation(x)] for x in x_labels]
+
+    hor_texts = [[] for x in x_labels]
+    ver_texts = [[] for y in y_labels]
+    if draw_legend == 1 or draw_legend == 2:
+        hor_texts = [[images.GridAnnotation(x)] for x in x_labels]
+    if draw_legend == 1 or draw_legend == 3:
+        ver_texts = [[images.GridAnnotation(y)] for y in y_labels]
 
     # Temporary list of all the images that are generated to be populated into the grid.
     # Will be filled with empty images for any individual step that fails to process properly
@@ -329,7 +334,7 @@ def draw_xy_grid(p, xs, ys, x_labels, y_labels, cell, draw_legend, include_lone_
                 image_cache.append(_image_cache[_index])
 
     grid = images.image_grid(image_cache, rows=len(ys))
-    if draw_legend:
+    if draw_legend != 0:
         grid = images.draw_grid_annotations(grid, cell_size[0], cell_size[1], hor_texts, ver_texts)
 
     processed_result.images[0] = grid
@@ -381,7 +386,6 @@ class Script(scripts.Script):
     def title(self):
         return TITLE
 
-
     def ui(self, is_img2img):
         xyp_current_axis_options = [x for x in axis_options if type(x) == AxisOption or type(x) == AxisOptionImg2Img and is_img2img]
 
@@ -396,11 +400,30 @@ class Script(scripts.Script):
             xyp_y_type = gr.Dropdown(label="Y type", choices=[x.label for x in xyp_current_axis_options], value=xyp_current_axis_options[0].label, type="index", elem_id="xyp_y_type")
             xyp_y_values = gr.Textbox(label="Y values", lines=1)
 
+        # "Checkpoint Dropdown"
+        with gr.Row(visible=False) as row_dd_ckpt:
+            with gr.Column(scale=1):
+                gr.HTML("<p style='max-width: 14em;'>* change 'type' to clear/reload dropdowns.</p>")
+            with gr.Column(scale=3):
+                dd_ckpt01 = gr.Dropdown(label="ckpt_01", choices=modules.sd_models.checkpoint_tiles(), visible=False)
+                dd_ckpt02 = gr.Dropdown(label="ckpt_02", choices=modules.sd_models.checkpoint_tiles(), visible=False)
+                dd_ckpt03 = gr.Dropdown(label="ckpt_03", choices=modules.sd_models.checkpoint_tiles(), visible=False)
+                dd_ckpt04 = gr.Dropdown(label="ckpt_04", choices=modules.sd_models.checkpoint_tiles(), visible=False)
+                dd_ckpt05 = gr.Dropdown(label="ckpt_05", choices=modules.sd_models.checkpoint_tiles(), visible=False)
+                dd_ckpt06 = gr.Dropdown(label="ckpt_06", choices=modules.sd_models.checkpoint_tiles(), visible=False)
+                dd_ckpt07 = gr.Dropdown(label="ckpt_07", choices=modules.sd_models.checkpoint_tiles(), visible=False)
+                dd_ckpt08 = gr.Dropdown(label="ckpt_08", choices=modules.sd_models.checkpoint_tiles(), visible=False)
+                dd_ckpt09 = gr.Dropdown(label="ckpt_09", choices=modules.sd_models.checkpoint_tiles(), visible=False)
+                dd_ckpt10 = gr.Dropdown(label="ckpt_10", choices=modules.sd_models.checkpoint_tiles(), visible=False)
+                dd_ckpt_list = [dd_ckpt01,dd_ckpt02,dd_ckpt03,dd_ckpt04,dd_ckpt05,dd_ckpt06,dd_ckpt07,dd_ckpt08,dd_ckpt09,dd_ckpt10]
+
         # Default xy_grid checkbox
         with gr.Row():
-            xyp_draw_legend = gr.Checkbox(label='Draw legend', value=True)
             xyp_include_lone_images = gr.Checkbox(label='Include Separate Images', value=True)
             xyp_no_fixed_seeds = gr.Checkbox(label='Keep -1 for seeds', value=False)
+
+        with gr.Row():
+            xyp_draw_legends = gr.Radio(label="Draw Legends", choices=["None", "Both", "X", "Y"], type="index", value="Both")
 
         # Additional check box below.
         with gr.Row():
@@ -408,14 +431,80 @@ class Script(scripts.Script):
             xyp_show_only_favorite_axis_option = gr.Checkbox(label="Show only favorite Axis Option", value=False)
             xyp_save_info_in_grid = gr.Checkbox(label="Save PNGinfo to grid", value=True)
 
+        #
         # Event
+        #
+        def on_change_xy_type(op_type, sub_type):
+            op_type = axis_options[op_type]
+            sub_type = axis_options[sub_type]
+            if op_type.label != "Checkpoint Dropdown":
+                return [gr.update(), gr.update()] + [gr.update(visible=False)] + [ gr.update(value="", visible=False) for x in range(len(dd_ckpt_list)) ]
+            else:
+                if sub_type.label == "Checkpoint Dropdown" or sub_type.label == "Checkpoint name":
+                    return [gr.update(value="Nothing"), gr.update()] + [gr.update(visible=True)] + [gr.update()] * len(dd_ckpt_list)
+                else:
+                    return [gr.update(), gr.update()] + [gr.update(visible=True)] + [gr.update(value="", visible=True)] + [gr.update(value="") for x in range(len(dd_ckpt_list)-1)]
+        xyp_x_type.change(
+            fn=on_change_xy_type,
+            inputs=[xyp_x_type, xyp_y_type],
+            outputs=[xyp_x_type, xyp_x_values, row_dd_ckpt] + dd_ckpt_list
+            )
+        xyp_y_type.change(
+            fn=on_change_xy_type,
+            inputs=[xyp_y_type, xyp_x_type],
+            outputs=[xyp_y_type, xyp_y_values, row_dd_ckpt] + dd_ckpt_list
+            )
+
+        def on_change_dd_ckpt(
+            dd_ckpt01,dd_ckpt02,dd_ckpt03,dd_ckpt04,dd_ckpt05,dd_ckpt06,dd_ckpt07,dd_ckpt08,dd_ckpt09,dd_ckpt10,
+            xyp_x_type, xyp_x_values, xyp_y_type, xyp_y_values
+        ):
+            dd_ckpt_list = [dd_ckpt01,dd_ckpt02,dd_ckpt03,dd_ckpt04,dd_ckpt05,dd_ckpt06,dd_ckpt07,dd_ckpt08,dd_ckpt09,dd_ckpt10]
+            # find which dd selected, current row_index
+            row_index = -1
+            _output_txt = ""
+            for index, _dd_ckpt in enumerate(dd_ckpt_list):
+                if _dd_ckpt == "" or _dd_ckpt == None:
+                    row_index = index
+                    break
+                else:
+                    _dd_ckpt = modules.sd_models.get_closet_checkpoint_match(_dd_ckpt).model_name
+                    if _output_txt != "":
+                        _output_txt += "\n" + _dd_ckpt
+                    else:
+                        _output_txt = _dd_ckpt
+            # make update object
+            if axis_options[xyp_x_type].label == "Checkpoint Dropdown":
+                _ret = [gr.update(value=_output_txt), gr.update()]
+            elif axis_options[xyp_y_type].label == "Checkpoint Dropdown":
+                _ret = [gr.update(), gr.update(value=_output_txt)]
+            else:
+                _ret = [gr.update(), gr.update()]
+            # make dd update
+            if row_index == -1:
+                _dd_ret = [ gr.update() for x in range(len(dd_ckpt_list)) ] + _ret
+            else:
+                _dd_ret = [ gr.update() for x in range(row_index) ] + [ gr.update(value="", visible=True, choices=modules.sd_models.checkpoint_tiles())] + [ gr.update() for x in range(len(dd_ckpt_list) - row_index - 1)] + _ret
+            return _dd_ret
+        dd_ckpt01.change(
+            fn=on_change_dd_ckpt,
+            inputs=dd_ckpt_list + [xyp_x_type, xyp_x_values] + [xyp_y_type, xyp_y_values],
+            outputs=dd_ckpt_list + [xyp_x_values, xyp_y_values]
+            )
+        dd_ckpt02.change(fn=on_change_dd_ckpt, inputs=dd_ckpt_list + [xyp_x_type, xyp_x_values] + [xyp_y_type, xyp_y_values], outputs=dd_ckpt_list + [xyp_x_values, xyp_y_values])
+        dd_ckpt03.change(fn=on_change_dd_ckpt, inputs=dd_ckpt_list + [xyp_x_type, xyp_x_values] + [xyp_y_type, xyp_y_values], outputs=dd_ckpt_list + [xyp_x_values, xyp_y_values])
+        dd_ckpt04.change(fn=on_change_dd_ckpt, inputs=dd_ckpt_list + [xyp_x_type, xyp_x_values] + [xyp_y_type, xyp_y_values], outputs=dd_ckpt_list + [xyp_x_values, xyp_y_values])
+        dd_ckpt05.change(fn=on_change_dd_ckpt, inputs=dd_ckpt_list + [xyp_x_type, xyp_x_values] + [xyp_y_type, xyp_y_values], outputs=dd_ckpt_list + [xyp_x_values, xyp_y_values])
+        dd_ckpt06.change(fn=on_change_dd_ckpt, inputs=dd_ckpt_list + [xyp_x_type, xyp_x_values] + [xyp_y_type, xyp_y_values], outputs=dd_ckpt_list + [xyp_x_values, xyp_y_values])
+        dd_ckpt07.change(fn=on_change_dd_ckpt, inputs=dd_ckpt_list + [xyp_x_type, xyp_x_values] + [xyp_y_type, xyp_y_values], outputs=dd_ckpt_list + [xyp_x_values, xyp_y_values])
+        dd_ckpt08.change(fn=on_change_dd_ckpt, inputs=dd_ckpt_list + [xyp_x_type, xyp_x_values] + [xyp_y_type, xyp_y_values], outputs=dd_ckpt_list + [xyp_x_values, xyp_y_values])
+        dd_ckpt09.change(fn=on_change_dd_ckpt, inputs=dd_ckpt_list + [xyp_x_type, xyp_x_values] + [xyp_y_type, xyp_y_values], outputs=dd_ckpt_list + [xyp_x_values, xyp_y_values])
+        dd_ckpt10.change(fn=on_change_dd_ckpt, inputs=dd_ckpt_list + [xyp_x_type, xyp_x_values] + [xyp_y_type, xyp_y_values], outputs=dd_ckpt_list + [xyp_x_values, xyp_y_values])
+
         def select_axis_list(is_selected):
             _current_axis_options = [x for x in axis_options if type(x) == AxisOption or type(x) == AxisOptionImg2Img and is_img2img]
             if is_selected:
                 _current_axis_options = [x for x in _current_axis_options if x.label in FAVORITE_AXISOPTION_NAMES]
-            # TODO
-            # I want to keep current setting if it is available after Dropdown choice change,
-            # but x_type.value has 'None' or 'Seed' which is default value (or already reset to default) ...
             labels = [x.label for x in _current_axis_options]
             return gr.update(choices=labels, value=xyp_x_type.value if xyp_x_type.value in labels else labels[1]), gr.update(choices=labels, value=xyp_y_type.value if xyp_y_type.value in labels else labels[0]),
 
@@ -425,7 +514,7 @@ class Script(scripts.Script):
             outputs=[xyp_x_type, xyp_y_type]
         )
 
-        return [xyp_x_type, xyp_x_values, xyp_y_type, xyp_y_values, xyp_draw_legend, xyp_include_lone_images, xyp_no_fixed_seeds, xyp_start_from, xyp_restore_checkpoint, xyp_show_only_favorite_axis_option, xyp_save_info_in_grid]
+        return [xyp_x_type, xyp_x_values, xyp_y_type, xyp_y_values, xyp_draw_legends, xyp_include_lone_images, xyp_no_fixed_seeds, xyp_start_from, xyp_restore_checkpoint, xyp_show_only_favorite_axis_option, xyp_save_info_in_grid]
 
 
     def run(self, p, x_type, x_values, y_type, y_values, draw_legend, include_lone_images, no_fixed_seeds, start_from, restore_checkpoint, show_only_favorite_axis_option, save_info_in_grid):
@@ -439,6 +528,12 @@ class Script(scripts.Script):
         def process_axis(opt, vals):
             if opt.label == 'Nothing':
                 return [0]
+
+            if opt.label == 'Sampler' and vals.strip() == '*':
+                if p.enable_hr is True:
+                    vals = ','.join([x.name for x in modules.sd_samplers.samplers_for_img2img])
+                else:
+                    vals = ','.join([x.name for x in modules.sd_samplers.all_samplers])
 
             valslist = [x.strip() for x in chain.from_iterable(csv.reader(StringIO(vals)))]
 
@@ -584,9 +679,9 @@ class Script(scripts.Script):
         y_opt = axis_options[y_type]
         ys = process_axis(y_opt, y_values)
 
-        # 'Checkpoint name'
+        # 'Checkpoint name' or 'Checkpoint Dropdown'
         def get_axis_val_and_label(p, axis_opt, _s):
-            if axis_opt.label == 'Checkpoint name':
+            if axis_opt.label == 'Checkpoint name' or axis_opt.label == 'Checkpoint Dropdown':
                 _vals = [_.split('#')[0].strip() if '#' in _ else _ for _ in _s]
                 _labels = [_.split('#')[1].strip() if '#' in _ else _ for _ in _s]
             else:
@@ -648,6 +743,9 @@ class Script(scripts.Script):
 
         if opts.grid_save and processed:
             if save_info_in_grid:
+                # workaround for p.all_negative_prompts == None
+                if not p.all_negative_prompts:
+                    p.all_negative_prompts = processed.all_negative_prompts
                 infotext = processed.infotext(p, 0)
             else:
                 infotext = None
