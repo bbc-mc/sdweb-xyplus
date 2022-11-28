@@ -54,6 +54,9 @@
 #   - allow to choose checkpoint by dropdown
 # Add selection Radio for grid Legends
 
+# ver 1.4.1
+# Bug fix: cant find checkpoint name when selected on "Checkpoint Dropdown" include sub-directory path
+
 from collections import namedtuple
 from copy import copy
 from itertools import permutations, chain
@@ -78,7 +81,7 @@ import re
 
 
 # Setting values
-VERSION = "1.4.0"
+VERSION = "1.4.1"
 TITLE_HEADER = "X/Y Plus"
 FILE_HEADER = "xy_plus"
 FAVORITE_AXISOPTION_NAMES = ["Nothing", "Seed", "Steps", "CFG Scale", "Sampler", "Prompt S/R", "Checkpoint name", "Hypernetwork", "Checkpoint Dropdown"]
@@ -468,7 +471,7 @@ class Script(scripts.Script):
                     row_index = index
                     break
                 else:
-                    _dd_ckpt = modules.sd_models.get_closet_checkpoint_match(_dd_ckpt).model_name
+                    _dd_ckpt = os.path.basename(modules.sd_models.get_closet_checkpoint_match(_dd_ckpt).filename)
                     if _output_txt != "":
                         _output_txt += "\n" + _dd_ckpt
                     else:
