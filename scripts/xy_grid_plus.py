@@ -57,6 +57,10 @@
 # ver 1.4.1
 # Bug fix: cant find checkpoint name when selected on "Checkpoint Dropdown" include sub-directory path
 
+# ver 1.4.2
+# Rebase xy_grid.py on commit ce049c4
+# Bug fix: checkpoint list on "Checkpoint Dropdown" dropdowns is not reloaded
+
 from collections import namedtuple
 from copy import copy
 from itertools import permutations, chain
@@ -81,7 +85,7 @@ import re
 
 
 # Setting values
-VERSION = "1.4.1"
+VERSION = "1.4.2"
 TITLE_HEADER = "X/Y Plus"
 FILE_HEADER = "xy_plus"
 FAVORITE_AXISOPTION_NAMES = ["Nothing", "Seed", "Steps", "CFG Scale", "Sampler", "Prompt S/R", "Checkpoint name", "Hypernetwork", "Checkpoint Dropdown"]
@@ -440,22 +444,25 @@ class Script(scripts.Script):
         def on_change_xy_type(op_type, sub_type):
             op_type = axis_options[op_type]
             sub_type = axis_options[sub_type]
-            if op_type.label != "Checkpoint Dropdown":
-                return [gr.update(), gr.update()] + [gr.update(visible=False)] + [ gr.update(value="", visible=False) for x in range(len(dd_ckpt_list)) ]
+            if op_type.label == "Checkpoint Dropdown" and (sub_type.label == "Checkpoint Dropdown" or sub_type.label == "Checkpoint name"):
+                return [gr.update(value="Nothing"), gr.update()] + [gr.update(visible=True)] + [gr.update()] * len(dd_ckpt_list)
+            elif op_type.label != "Checkpoint Dropdown" and sub_type.label == "Checkpoint Dropdown":
+                return [gr.update(), gr.update()] + [gr.update(visible=True)] + [gr.update()] * len(dd_ckpt_list)
+            elif op_type.label == "Checkpoint Dropdown" and sub_type.label != "Checkpoint Dropdown":
+                # すなおに描画
+                return [gr.update(), gr.update()] + [gr.update(visible=True)] + [gr.update(value="", visible=True, choices=modules.sd_models.checkpoint_tiles())] + [gr.update(value="") for x in range(len(dd_ckpt_list)-1)]
             else:
-                if sub_type.label == "Checkpoint Dropdown" or sub_type.label == "Checkpoint name":
-                    return [gr.update(value="Nothing"), gr.update()] + [gr.update(visible=True)] + [gr.update()] * len(dd_ckpt_list)
-                else:
-                    return [gr.update(), gr.update()] + [gr.update(visible=True)] + [gr.update(value="", visible=True)] + [gr.update(value="") for x in range(len(dd_ckpt_list)-1)]
+                return [gr.update(), gr.update()] + [gr.update(visible=False)] + [ gr.update(value="", visible=False) for x in range(len(dd_ckpt_list)) ]
+
         xyp_x_type.change(
             fn=on_change_xy_type,
             inputs=[xyp_x_type, xyp_y_type],
-            outputs=[xyp_x_type, xyp_x_values, row_dd_ckpt] + dd_ckpt_list
+            outputs=[xyp_x_type, xyp_x_values] + [row_dd_ckpt] + dd_ckpt_list
             )
         xyp_y_type.change(
             fn=on_change_xy_type,
             inputs=[xyp_y_type, xyp_x_type],
-            outputs=[xyp_y_type, xyp_y_values, row_dd_ckpt] + dd_ckpt_list
+            outputs=[xyp_y_type, xyp_y_values] + [row_dd_ckpt] + dd_ckpt_list
             )
 
         def on_change_dd_ckpt(
@@ -467,15 +474,18 @@ class Script(scripts.Script):
             row_index = -1
             _output_txt = ""
             for index, _dd_ckpt in enumerate(dd_ckpt_list):
-                if _dd_ckpt == "" or _dd_ckpt == None:
+                print(f"dd_ckpt[{index}]: [{_dd_ckpt}]")
+                if _dd_ckpt == "" or _dd_ckpt == None or _dd_ckpt == {}:
                     row_index = index
                     break
                 else:
-                    _dd_ckpt = os.path.basename(modules.sd_models.get_closet_checkpoint_match(_dd_ckpt).filename)
-                    if _output_txt != "":
-                        _output_txt += "\n" + _dd_ckpt
-                    else:
-                        _output_txt = _dd_ckpt
+                    _model_info = modules.sd_models.get_closet_checkpoint_match(_dd_ckpt)
+                    if _model_info:
+                        _dd_ckpt = os.path.basename(_model_info.filename)
+                        if _output_txt != "":
+                            _output_txt += "\n" + _dd_ckpt
+                        else:
+                            _output_txt = _dd_ckpt
             # make update object
             if axis_options[xyp_x_type].label == "Checkpoint Dropdown":
                 _ret = [gr.update(value=_output_txt), gr.update()]
@@ -752,7 +762,8 @@ class Script(scripts.Script):
                 infotext = processed.infotext(p, 0)
             else:
                 infotext = None
-            images.save_image(processed.images[0], p.outpath_grids, GRID_FILENAME_HEADER, info=infotext, prompt=p.prompt, seed=processed.seed, grid=True, p=p)
+            images.save_image(processed.images[0], p.outpath_grids, GRID_FILENAME_HEADER, info=infotext, extension=opts.grid_format, prompt=p.prompt, seed=processed.seed, grid=True, p=p)
+
         # restore checkpoint in case it was changed by axes
         if restore_checkpoint and not state.interrupted:
             modules.sd_models.reload_model_weights(shared.sd_model)
