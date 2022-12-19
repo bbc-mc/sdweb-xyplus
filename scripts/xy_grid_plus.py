@@ -474,7 +474,7 @@ class Script(scripts.Script):
             row_index = -1
             _output_txt = ""
             for index, _dd_ckpt in enumerate(dd_ckpt_list):
-                print(f"dd_ckpt[{index}]: [{_dd_ckpt}]")
+                dprint(f"dd_ckpt[{index}]: [{_dd_ckpt}]")
                 if _dd_ckpt == "" or _dd_ckpt == None or _dd_ckpt == {}:
                     row_index = index
                     break
